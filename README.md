@@ -87,6 +87,10 @@ jobs:
 
 Silence a false positive with a trailing comment containing `launch-audit: ignore`.
 
+In a git repository, `scan.py` reads the files git would ship (tracked, plus untracked files that `.gitignore` does not exclude), so build output and caches (`dist/`, `.next/`, `.lighthouseci/`…) don't flood the report. Pass `--all-files` to walk everything, for example to look for secrets inlined into a local build.
+
+If `check_live.py` is sent to another host (a login page such as Cloudflare Access, Auth0 or Okta), it checks HTTPS, HSTS and exposed files on your host and skips the rest: the login page's headers and HTML are the provider's, not your app's.
+
 On Windows, use `python` or `py` instead of `python3`. Both scripts detect consoles that can't show emoji (e.g. cp1252) and fall back to plain ASCII; pass `--ascii` to force it.
 
 ## Structure

@@ -40,6 +40,9 @@ SKIP_DIRS = {
     ".next", ".nuxt", ".svelte-kit", ".turbo", ".cache", "coverage", ".dart_tool",
     "Pods", "DerivedData", "target", ".gradle", ".idea", ".vscode", "bower_components",
     ".terraform", ".pytest_cache", ".mypy_cache", "site-packages", ".expo",
+    # build output and tool caches (generated, often huge, full of minified framework code)
+    ".astro", ".wrangler", ".lighthouseci", ".output", ".vercel", ".netlify", ".parcel-cache",
+    ".docusaurus", ".angular", "storybook-static",
 }
 BINARY_EXT = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp", ".tiff", ".psd",
@@ -85,6 +88,14 @@ SECRET_RULES = [
     ("generic-secret-assign", "Medium", "SEC-101", "Hard-coded credential-looking value",
      r"(?i)\b[\w\-]*(api[_\-]?key|secret|token|passw(or)?d|private[_\-]?key|client[_\-]?secret)[\w\-]*\b['\"]?\s*[:=]\s*['\"][^'\"\s]{12,}['\"]"),
 ]
+# Official test keys that are public by design (they only work in test mode).
+KNOWN_TEST_VALUES = re.compile(
+    r"\b[0-3]x0{20,}[A-Z]{2}\b"                    # Cloudflare Turnstile test site/secret keys
+    r"|\b0x0{40}\b"                               # hCaptcha test secret
+    r"|6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe"   # reCAPTCHA v2 test secret
+    r"|6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI")  # reCAPTCHA v2 test site key
+# Client-prefixed variables that are public by design (analytics beacons, captcha site keys...).
+PUBLIC_BY_DESIGN = re.compile(r"ANALYTICS|BEACON|SITE_?KEY|PUBLISHABLE|ANON_KEY|MEASUREMENT_ID")
 JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")
 
 CODE_RULES = [
@@ -168,7 +179,9 @@ DELETE_ACCOUNT = re.compile(r"(?i)delete[-_ ]?(my[-_ ]?)?account|deleteAccount|d
 UNSUB = re.compile(r"(?i)unsubscribe|List-Unsubscribe|cancelar[-_ ]subscri")
 AUTH_HINT = re.compile(r"(?i)signUp|sign_up|signup|createUserWith|register\(|auth\.signIn|supabase\.auth|firebase/auth|next-auth|@clerk|lucia|passport|devise|django\.contrib\.auth")
 EMAIL_HINT = re.compile(r"(?i)nodemailer|@sendgrid|resend|mailchimp|postmark|mailgun|brevo|sendinblue|ses\.send|send_mail\(")
-IMG_NO_ALT = re.compile(r"<(img|Image)\b(?![^>]*\balt\s*=)[^>]*>", re.S)
+# `alt` with a value or bare (`<img alt>` is how Astro renders alt=""): both count.
+IMG_NO_ALT = re.compile(r"<(img|Image)\b(?![^>]*\salt(?=\s*=|\s|/?>))[^>]*>", re.S)
+SUPABASE_HINT = re.compile(r"@supabase/|\bsupabase\.co\b|from supabase import|\bsupabase_url\b", re.I)
 
 # ---------------------------------------------------------------------------
 
@@ -209,9 +222,11 @@ def b64json(seg: str):
 
 
 class Scanner:
-    def __init__(self, root: Path, max_per_rule: int):
+    def __init__(self, root: Path, max_per_rule: int, all_files: bool = False):
         self.root = root
         self.max_per_rule = max_per_rule
+        self.all_files = all_files
+        self.walk_mode = ""
         self.findings = []           # dicts
         self._seen = set()
         self.files_scanned = 0
@@ -248,33 +263,60 @@ class Scanner:
             return str(p)
 
     # -- walk ----------------------------------------------------------------
-    def walk(self):
+    def git_files(self):
+        """Files git would ship (tracked, plus untracked ones .gitignore does not exclude), or None
+        outside a git work tree. Leaves out the build output and caches the project ignores."""
+        if not shutil.which("git"):
+            return None
+        try:
+            out = subprocess.run(["git", "-C", str(self.root), "-c", "core.quotePath=false", "ls-files",
+                                  "-z", "--cached", "--others", "--exclude-standard"],
+                                 capture_output=True, timeout=120)
+        except Exception:
+            return None
+        if out.returncode != 0:
+            return None
+        files = sorted({f for f in out.stdout.decode("utf-8", "replace").split("\0") if f})
+        return [self.root / f for f in files
+                if not any(part in SKIP_DIRS or part.startswith(".git") for part in Path(f).parts[:-1])]
+
+    def iter_files(self):
+        files = None if self.all_files else self.git_files()
+        if files is not None:
+            self.walk_mode = "git files, .gitignore respected"
+            yield from files
+            return
+        self.walk_mode = "all files"
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".git")]
             for name in filenames:
-                p = Path(dirpath) / name
-                if name in LOCKFILES:
-                    self.lockfiles.add(name)
-                if name in {"package.json", "requirements.txt", "pyproject.toml", "Pipfile", "Gemfile",
-                            "composer.json", "Cargo.toml", "go.mod", "pubspec.yaml", "build.gradle",
-                            "build.gradle.kts", "Podfile"}:
-                    self.manifests.append(self.rel(p))
-                ext = "".join(p.suffixes[-2:]) if name.endswith(".blade.php") else p.suffix.lower()
-                if ext in BINARY_EXT or name.endswith(".min.js") or name.endswith(".map") or name in LOCKFILES:
+                yield Path(dirpath) / name
+
+    def walk(self):
+        for p in self.iter_files():
+            name = p.name
+            if name in LOCKFILES:
+                self.lockfiles.add(name)
+            if name in {"package.json", "requirements.txt", "pyproject.toml", "Pipfile", "Gemfile",
+                        "composer.json", "Cargo.toml", "go.mod", "pubspec.yaml", "build.gradle",
+                        "build.gradle.kts", "Podfile"}:
+                self.manifests.append(self.rel(p))
+            ext = "".join(p.suffixes[-2:]) if name.endswith(".blade.php") else p.suffix.lower()
+            if ext in BINARY_EXT or name.endswith(".min.js") or name.endswith(".map") or name in LOCKFILES:
+                continue
+            try:
+                if p.stat().st_size > MAX_FILE_BYTES:
                     continue
-                try:
-                    if p.stat().st_size > MAX_FILE_BYTES:
-                        continue
-                    raw = p.read_bytes()
-                except OSError:
-                    continue
-                if b"\x00" in raw[:4096]:
-                    continue
-                text = raw.decode("utf-8", "ignore")
-                if "launch-audit: ignore-file" in text[:400]:
-                    continue
-                self.files_scanned += 1
-                self.scan_file(p, name, ext, text)
+                raw = p.read_bytes()
+            except OSError:
+                continue
+            if b"\x00" in raw[:4096]:
+                continue
+            text = raw.decode("utf-8", "ignore")
+            if "launch-audit: ignore-file" in text[:400]:
+                continue
+            self.files_scanned += 1
+            self.scan_file(p, name, ext, text)
 
     def scan_file(self, p: Path, name: str, ext: str, text: str):
         rel = self.rel(p)
@@ -294,6 +336,8 @@ class Scanner:
                 if not m:
                     continue
                 val = m.group(0)
+                if KNOWN_TEST_VALUES.search(val):
+                    continue
                 if rule in ("generic-secret-assign", "db-url-password"):
                     if PLACEHOLDER.search(val) or is_example:
                         continue
@@ -323,7 +367,10 @@ class Scanner:
                     continue
                 if scope == "all" and is_doc:
                     continue
-                if rx.search(line):
+                m = rx.search(line)
+                if m:
+                    if rule == "public-env-secret" and PUBLIC_BY_DESIGN.search(m.group(0)):
+                        continue
                     snippet = line.strip()[:140]
                     if rule in ("generic-secret-assign",):
                         snippet = ""
@@ -392,6 +439,8 @@ class Scanner:
                     self.signals["email-sending"].append(rel)
                 if CONSENT_TEXT.search(text):
                     self.signals["consent"].append(rel)
+                if SUPABASE_HINT.search(text):
+                    self.signals["supabase"].append(rel)
         if ext in MARKUP_EXT:
             for m in IMG_NO_ALT.finditer(text):
                 line_no = text.count("\n", 0, m.start()) + 1
@@ -485,14 +534,17 @@ class Scanner:
             pass
 
     def post_checks(self):
-        # Supabase RLS
-        if self.sql_tables:
+        # Supabase RLS: only meaningful when tables are exposed through the Supabase API
+        # (not for SQLite/D1, MySQL, or a Postgres that only a server talks to).
+        uses_supabase = self.has_supabase or bool(self.signals.get("supabase")) or any(
+            d.startswith("@supabase/") or d == "supabase" for d in self.pkg_deps)
+        if self.sql_tables and uses_supabase:
             missing = sorted(t for t in self.sql_tables if t not in self.rls_tables)
             sev = "Critical" if self.has_supabase else "High"
             for t in missing:
                 self.add("rls-missing", self.sql_tables[t], None, f"table `{t}`", severity=sev, ref="SEC-303",
                          title="Table created without `enable row level security` in migrations"
-                         + ("" if self.has_supabase else " (only matters if exposed via a Supabase/PostgREST API)"))
+                         + ("" if self.has_supabase else " (only matters if exposed via the Supabase API)"))
         # lockfiles
         js = any(m.endswith("package.json") for m in self.manifests)
         if js and not ({"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb"} & self.lockfiles):
@@ -588,7 +640,7 @@ def render_md(sc: Scanner, audits, cmds) -> str:
     for f in sc.findings:
         counts[f["severity"]] += 1
     out.append(f"# launch-audit scan — `{sc.root}`\n")
-    out.append(f"Files scanned: {sc.files_scanned} · Manifests: {', '.join(sc.manifests) or 'none'}\n")
+    out.append(f"Files scanned: {sc.files_scanned} ({sc.walk_mode}) · Manifests: {', '.join(sc.manifests) or 'none'}\n")
     out.append("| " + " | ".join(SEVERITY_ORDER) + " |")
     out.append("|" + "---:|" * len(SEVERITY_ORDER))
     out.append("| " + " | ".join(str(counts[s]) for s in SEVERITY_ORDER) + " |\n")
@@ -629,6 +681,8 @@ def main():
     ap.add_argument("--json", action="store_true", help="JSON output")
     ap.add_argument("--run-audits", action="store_true", help="run available dependency auditors")
     ap.add_argument("--max-per-rule", type=int, default=15)
+    ap.add_argument("--all-files", action="store_true",
+                    help="walk every file, including what .gitignore excludes (e.g. built bundles)")
     ap.add_argument("--ascii", action="store_true", help="plain ASCII output")
     args = ap.parse_args()
     unicode_ok = setup_console() and not args.ascii
@@ -637,7 +691,7 @@ def main():
     if not root.is_dir():
         print(f"Not a directory: {root}", file=sys.stderr)
         sys.exit(2)
-    sc = Scanner(root, args.max_per_rule)
+    sc = Scanner(root, args.max_per_rule, all_files=args.all_files)
     sc.walk()
     sc.git_checks()
     if args.history:
@@ -648,7 +702,8 @@ def main():
     sc.findings.sort(key=lambda f: (SEVERITY_ORDER.index(f["severity"]), f["ref"], f["file"], f["line"] or 0))
 
     if args.json:
-        print(json.dumps({"root": str(root), "files_scanned": sc.files_scanned, "manifests": sc.manifests,
+        print(json.dumps({"root": str(root), "files_scanned": sc.files_scanned, "walk_mode": sc.walk_mode,
+                          "manifests": sc.manifests,
                           "findings": sc.findings, "audits": audits, "next_commands": cmds}, indent=2, default=str))
     else:
         report = render_md(sc, audits, cmds)
