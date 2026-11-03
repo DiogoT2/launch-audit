@@ -29,6 +29,30 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+def setup_console() -> bool:
+    """Never crash on output. Windows consoles and pipes often use cp1252,
+    which can't encode emoji or arrows. Returns True if stdout can show them."""
+    unicode_ok = True
+    for stream in (sys.stdout, sys.stderr):
+        enc = getattr(stream, "encoding", None) or "ascii"
+        try:
+            "✅❌⚠ℹ→—…".encode(enc)
+        except (LookupError, UnicodeEncodeError):
+            if stream is sys.stdout:
+                unicode_ok = False
+        try:
+            stream.reconfigure(errors="replace")  # last-resort safety net
+        except (AttributeError, ValueError):
+            pass
+    return unicode_ok
+
+
+ASCII_MAP = str.maketrans({"→": "->", "—": "-", "–": "-", "…": "...", "·": "-",
+                           "“": '"', "”": '"', "‘": "'", "’": "'"})
+UNICODE_ICONS = {"FAIL": "❌", "WARN": "⚠️ ", "PASS": "✅", "INFO": "ℹ️ "}
+ASCII_ICONS = {"FAIL": "[FAIL]", "WARN": "[WARN]", "PASS": "[PASS]", "INFO": "[INFO]"}
+
+
 UA = "launch-audit/1.0 (+security self-check)"
 TIMEOUT = 15
 EVIL_ORIGIN = "https://evil.launch-audit.invalid"
@@ -330,19 +354,25 @@ def main():
     ap.add_argument("url")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-probe", action="store_true")
+    ap.add_argument("--ascii", action="store_true", help="plain ASCII output (no emoji)")
     args = ap.parse_args()
+    unicode_ok = setup_console() and not args.ascii
     rep, _ = check(args.url, probe=not args.no_probe)
     order = {"FAIL": 0, "WARN": 1, "PASS": 2, "INFO": 3}
     items = sorted(rep.items, key=lambda i: order.get(i["status"], 9))
     if args.json:
-        print(json.dumps({"url": args.url, "results": items}, indent=2))
+        print(json.dumps({"url": args.url, "results": items}, indent=2))  # ensure_ascii: always safe
     else:
-        icon = {"FAIL": "❌", "WARN": "⚠️ ", "PASS": "✅", "INFO": "ℹ️ "}
-        print(f"# launch-audit live check — {args.url}\n")
-        print("Only run against sites you own or are authorized to test.\n")
+        icon = UNICODE_ICONS if unicode_ok else ASCII_ICONS
+
+        def emit(text=""):
+            print(text if unicode_ok else text.translate(ASCII_MAP))
+
+        emit(f"# launch-audit live check — {args.url}\n")
+        emit("Only run against sites you own or are authorized to test.\n")
         for i in items:
             det = f" — {i['detail']}" if i["detail"] else ""
-            print(f"{icon.get(i['status'], '')} [{i['ref']}] {i['title']}{det}")
+            emit(f"{icon.get(i['status'], '')} [{i['ref']}] {i['title']}{det}")
     sys.exit(1 if any(i["status"] == "FAIL" for i in rep.items) else 0)
 
 

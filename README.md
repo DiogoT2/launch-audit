@@ -87,6 +87,8 @@ jobs:
 
 Silence a false positive with a trailing comment containing `launch-audit: ignore`.
 
+On Windows, use `python` or `py` instead of `python3`. Both scripts detect consoles that can't show emoji (e.g. cp1252) and fall back to plain ASCII; pass `--ascii` to force it.
+
 ## Structure
 
 ```

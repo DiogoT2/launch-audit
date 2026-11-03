@@ -173,6 +173,28 @@ IMG_NO_ALT = re.compile(r"<(img|Image)\b(?![^>]*\balt\s*=)[^>]*>", re.S)
 # ---------------------------------------------------------------------------
 
 
+def setup_console() -> bool:
+    """Never crash on output. Windows consoles and pipes often use cp1252, which can't
+    encode arrows or characters copied from scanned code. Returns True if stdout is Unicode-safe."""
+    unicode_ok = True
+    for stream in (sys.stdout, sys.stderr):
+        enc = getattr(stream, "encoding", None) or "ascii"
+        try:
+            "→—…·✅".encode(enc)
+        except (LookupError, UnicodeEncodeError):
+            if stream is sys.stdout:
+                unicode_ok = False
+        try:
+            stream.reconfigure(errors="replace")  # anything else from scanned files becomes '?'
+        except (AttributeError, ValueError):
+            pass
+    return unicode_ok
+
+
+ASCII_MAP = str.maketrans({"→": "->", "—": "-", "–": "-", "…": "...", "·": "-",
+                           "“": '"', "”": '"', "‘": "'", "’": "'"})
+
+
 def mask(value: str) -> str:
     value = value.strip()
     return value[:4] + "****" if len(value) > 4 else "****"
@@ -384,8 +406,9 @@ class Scanner:
                      title="Not a git repository (history and tracked-file checks skipped)")
             return
         try:
-            tracked = subprocess.run(["git", "-C", str(self.root), "ls-files"], capture_output=True,
-                                     text=True, timeout=60).stdout.splitlines()
+            tracked = subprocess.run(["git", "-C", str(self.root), "-c", "core.quotePath=false", "ls-files"],
+                                     capture_output=True, encoding="utf-8", errors="replace",
+                                     timeout=60).stdout.splitlines()
         except Exception:
             tracked = []
         for f in tracked:
@@ -399,7 +422,7 @@ class Scanner:
                 self.add("key-file-tracked", f, None, "", severity="High", ref="SEC-101",
                          title="Key/credential file tracked by git")
         gi = self.root / ".gitignore"
-        if not gi.exists() or not re.search(r"(?m)^\s*\*?\.env", gi.read_text(errors="ignore")):
+        if not gi.exists() or not re.search(r"(?m)^\s*\*?\.env", gi.read_text(encoding="utf-8", errors="ignore")):
             self.add("gitignore-env", ".gitignore", None, "", severity="Medium", ref="SEC-102",
                      title=".gitignore does not ignore .env files")
 
@@ -409,7 +432,8 @@ class Scanner:
         try:
             proc = subprocess.Popen(["git", "-C", str(self.root), "log", "-p", "--all", "--no-color",
                                      "--no-merges", "--format=__COMMIT__ %h"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="ignore")
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    encoding="utf-8", errors="ignore")
         except Exception:
             return
         commit, current_file, n = "?", "?", 0
@@ -533,7 +557,8 @@ class Scanner:
         results = []
         def run(cmd, cwd):
             try:
-                out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=300)
+                out = subprocess.run(cmd, cwd=cwd, capture_output=True, encoding="utf-8",
+                                     errors="replace", timeout=300)
                 return out.stdout
             except Exception as e:
                 return None
@@ -604,7 +629,9 @@ def main():
     ap.add_argument("--json", action="store_true", help="JSON output")
     ap.add_argument("--run-audits", action="store_true", help="run available dependency auditors")
     ap.add_argument("--max-per-rule", type=int, default=15)
+    ap.add_argument("--ascii", action="store_true", help="plain ASCII output")
     args = ap.parse_args()
+    unicode_ok = setup_console() and not args.ascii
 
     root = Path(args.path).resolve()
     if not root.is_dir():
@@ -624,7 +651,8 @@ def main():
         print(json.dumps({"root": str(root), "files_scanned": sc.files_scanned, "manifests": sc.manifests,
                           "findings": sc.findings, "audits": audits, "next_commands": cmds}, indent=2, default=str))
     else:
-        print(render_md(sc, audits, cmds))
+        report = render_md(sc, audits, cmds)
+        print(report if unicode_ok else report.translate(ASCII_MAP))
     sys.exit(1 if any(f["severity"] in ("Critical", "High") for f in sc.findings) else 0)
 
 
