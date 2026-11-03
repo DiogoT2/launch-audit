@@ -167,6 +167,22 @@ def check(url, probe=True):
         return rep, None
     rep.add("INFO", "-", f"Final URL {final['url']} → HTTP {final['status']}",
             " → ".join(f"{c.get('status', 'ERR')} {c['url']}" for c in chain))
+
+    # A redirect to another host (not just www. ↔ apex) is usually a login/SSO page
+    # (Cloudflare Access, Auth0, Okta...). Its headers and HTML are the provider's, not the site's:
+    # check the last response the target itself sent, and skip the HTML checks.
+    def bare(host):
+        host = host.lower()
+        return host[4:] if host.startswith("www.") else host
+    final_host = urllib.parse.urlparse(final["url"]).netloc
+    other_host = bare(final_host) != bare(parsed.netloc)
+    if other_host:
+        own = [c for c in chain if "error" not in c
+               and bare(urllib.parse.urlparse(c["url"]).netloc) == bare(parsed.netloc)]
+        final = own[-1]
+        rep.add("INFO", "-", f"Redirects to another host ({final_host}), probably a login page",
+                f"HSTS checked on the HTTP {final['status']} from {final['url']}; HTML checks skipped "
+                f"(run again with the final URL if that is your site)")
     if not final["url"].startswith("https://"):
         rep.add("FAIL", "SEC-501", "Site is not served over HTTPS")
 
@@ -189,72 +205,77 @@ def check(url, probe=True):
     hsts = hv("Strict-Transport-Security")
     m = re.search(r"max-age=(\d+)", hsts)
     if not hsts:
-        rep.add("FAIL", "SEC-501", "Missing Strict-Transport-Security (HSTS)")
+        rep.add("WARN" if other_host else "FAIL", "SEC-501", "Missing Strict-Transport-Security (HSTS)",
+                "on the login redirect; check the app's own responses after logging in" if other_host else "")
     elif m and int(m.group(1)) < 15552000:
         rep.add("WARN", "SEC-501", "HSTS max-age below 180 days", hsts)
     else:
         rep.add("PASS", "SEC-501", "HSTS present", hsts)
 
-    csp = hv("Content-Security-Policy")
-    csp_ro = hv("Content-Security-Policy-Report-Only")
-    if not csp:
-        rep.add("FAIL" if not csp_ro else "WARN", "SEC-502",
-                "Missing Content-Security-Policy" + (" (report-only present)" if csp_ro else ""))
+    if other_host:
+        rep.add("INFO", "SEC-502", "Behind a login on another host: headers, cookies and CORS not checked",
+                "they would describe the login redirect, not the app; check them with a logged-in browser")
     else:
-        weak = [w for w in ("'unsafe-inline'", "'unsafe-eval'", " * ", "data: *") if w in f" {csp} "]
-        if "script-src" not in csp and "default-src" not in csp:
-            weak.append("no script-src/default-src")
-        rep.add("WARN" if weak else "PASS", "SEC-502", "Content-Security-Policy present" + (f" but weak: {', '.join(weak)}" if weak else ""), csp[:300])
-    frame_ok = "frame-ancestors" in csp or hv("X-Frame-Options").upper() in ("DENY", "SAMEORIGIN")
-    rep.add("PASS" if frame_ok else "FAIL", "SEC-502", "Clickjacking protection (frame-ancestors / X-Frame-Options)",
-            hv("X-Frame-Options") or ("frame-ancestors in CSP" if frame_ok else "missing"))
-    rep.add("PASS" if hv("X-Content-Type-Options").lower() == "nosniff" else "FAIL", "SEC-502",
-            "X-Content-Type-Options: nosniff", hv("X-Content-Type-Options") or "missing")
-    rp = hv("Referrer-Policy")
-    rep.add("PASS" if rp and rp.lower() not in ("unsafe-url", "no-referrer-when-downgrade") else "WARN", "SEC-502",
-            "Referrer-Policy", rp or "missing (browser default applies)")
-    rep.add("PASS" if hv("Permissions-Policy") else "WARN", "SEC-502", "Permissions-Policy",
-            hv("Permissions-Policy")[:200] or "missing")
-    leaks = [f"{k}: {hv(k)}" for k in ("X-Powered-By", "X-AspNet-Version", "X-AspNetMvc-Version")
-             if hv(k)]
-    if re.search(r"\d", hv("Server")):
-        leaks.append(f"Server: {hv('Server')}")
-    rep.add("WARN" if leaks else "PASS", "SEC-502", "Version-revealing headers", "; ".join(leaks) or "none")
-
-    # --- cookies -----------------------------------------------------------
-    cookies = h.get_all("Set-Cookie") or []
-    for c in cookies:
-        name = c.split("=", 1)[0].strip()
-        low = c.lower()
-        missing = [f for f, ok in (("HttpOnly", "httponly" in low), ("Secure", "secure" in low),
-                                   ("SameSite", "samesite" in low)) if not ok]
-        sessiony = re.search(r"(?i)sess|auth|token|sid|jwt|login", name)
-        if missing:
-            rep.add("FAIL" if sessiony else "WARN", "SEC-205", f"Cookie `{name}` missing {', '.join(missing)}",
-                    "looks like a session cookie" if sessiony else "check whether it's sensitive")
+        csp = hv("Content-Security-Policy")
+        csp_ro = hv("Content-Security-Policy-Report-Only")
+        if not csp:
+            rep.add("FAIL" if not csp_ro else "WARN", "SEC-502",
+                    "Missing Content-Security-Policy" + (" (report-only present)" if csp_ro else ""))
         else:
-            rep.add("PASS", "SEC-205", f"Cookie `{name}` has HttpOnly, Secure, SameSite")
-    if not cookies:
-        rep.add("INFO", "SEC-205", "No cookies set on the landing page (check again after logging in)")
+            weak = [w for w in ("'unsafe-inline'", "'unsafe-eval'", " * ", "data: *") if w in f" {csp} "]
+            if "script-src" not in csp and "default-src" not in csp:
+                weak.append("no script-src/default-src")
+            rep.add("WARN" if weak else "PASS", "SEC-502", "Content-Security-Policy present" + (f" but weak: {', '.join(weak)}" if weak else ""), csp[:300])
+        frame_ok = "frame-ancestors" in csp or hv("X-Frame-Options").upper() in ("DENY", "SAMEORIGIN")
+        rep.add("PASS" if frame_ok else "FAIL", "SEC-502", "Clickjacking protection (frame-ancestors / X-Frame-Options)",
+                hv("X-Frame-Options") or ("frame-ancestors in CSP" if frame_ok else "missing"))
+        rep.add("PASS" if hv("X-Content-Type-Options").lower() == "nosniff" else "FAIL", "SEC-502",
+                "X-Content-Type-Options: nosniff", hv("X-Content-Type-Options") or "missing")
+        rp = hv("Referrer-Policy")
+        rep.add("PASS" if rp and rp.lower() not in ("unsafe-url", "no-referrer-when-downgrade") else "WARN", "SEC-502",
+                "Referrer-Policy", rp or "missing (browser default applies)")
+        rep.add("PASS" if hv("Permissions-Policy") else "WARN", "SEC-502", "Permissions-Policy",
+                hv("Permissions-Policy")[:200] or "missing")
+        leaks = [f"{k}: {hv(k)}" for k in ("X-Powered-By", "X-AspNet-Version", "X-AspNetMvc-Version")
+                 if hv(k)]
+        if re.search(r"\d", hv("Server")):
+            leaks.append(f"Server: {hv('Server')}")
+        rep.add("WARN" if leaks else "PASS", "SEC-502", "Version-revealing headers", "; ".join(leaks) or "none")
 
-    # --- CORS ---------------------------------------------------------------
-    cr = fetch(final["url"], headers={"Origin": EVIL_ORIGIN})
-    if "error" not in cr:
-        acao = cr["headers"].get("Access-Control-Allow-Origin", "")
-        acac = cr["headers"].get("Access-Control-Allow-Credentials", "")
-        if acao == EVIL_ORIGIN and acac.lower() == "true":
-            rep.add("FAIL", "SEC-503", "CORS reflects any Origin WITH credentials", f"ACAO={acao}, ACAC={acac}")
-        elif acao == EVIL_ORIGIN:
-            rep.add("WARN", "SEC-503", "CORS reflects any Origin", f"ACAO={acao}")
-        elif acao == "*":
-            rep.add("WARN", "SEC-503", "CORS allows all origins (*) — fine for public static content only")
-        else:
-            rep.add("PASS", "SEC-503", "CORS does not trust a foreign origin on the landing page",
-                    "test your API endpoints too")
+        # --- cookies -----------------------------------------------------------
+        cookies = h.get_all("Set-Cookie") or []
+        for c in cookies:
+            name = c.split("=", 1)[0].strip()
+            low = c.lower()
+            missing = [f for f, ok in (("HttpOnly", "httponly" in low), ("Secure", "secure" in low),
+                                       ("SameSite", "samesite" in low)) if not ok]
+            sessiony = re.search(r"(?i)sess|auth|token|sid|jwt|login", name)
+            if missing:
+                rep.add("FAIL" if sessiony else "WARN", "SEC-205", f"Cookie `{name}` missing {', '.join(missing)}",
+                        "looks like a session cookie" if sessiony else "check whether it's sensitive")
+            else:
+                rep.add("PASS", "SEC-205", f"Cookie `{name}` has HttpOnly, Secure, SameSite")
+        if not cookies:
+            rep.add("INFO", "SEC-205", "No cookies set on the landing page (check again after logging in)")
+
+        # --- CORS ---------------------------------------------------------------
+        cr = fetch(final["url"], headers={"Origin": EVIL_ORIGIN})
+        if "error" not in cr:
+            acao = cr["headers"].get("Access-Control-Allow-Origin", "")
+            acac = cr["headers"].get("Access-Control-Allow-Credentials", "")
+            if acao == EVIL_ORIGIN and acac.lower() == "true":
+                rep.add("FAIL", "SEC-503", "CORS reflects any Origin WITH credentials", f"ACAO={acao}, ACAC={acac}")
+            elif acao == EVIL_ORIGIN:
+                rep.add("WARN", "SEC-503", "CORS reflects any Origin", f"ACAO={acao}")
+            elif acao == "*":
+                rep.add("WARN", "SEC-503", "CORS allows all origins (*) — fine for public static content only")
+            else:
+                rep.add("PASS", "SEC-503", "CORS does not trust a foreign origin on the landing page",
+                        "test your API endpoints too")
 
     # --- HTML analysis -----------------------------------------------------
     html = final["body"].decode("utf-8", "ignore")
-    is_html = "<html" in html.lower() or "<!doctype html" in html.lower()
+    is_html = not other_host and ("<html" in html.lower() or "<!doctype html" in html.lower())
     if is_html:
         mixed = sorted(set(re.findall(r"(?i)(?:src|href)\s*=\s*['\"](http://[^'\"]+)", html)))
         mixed = [u for u in mixed if not re.search(r"(?i)\.(dtd|xsd)$|w3\.org|schema\.org", u)]
@@ -281,7 +302,7 @@ def check(url, probe=True):
         if not re.search(r"(?i)<html[^>]*\blang\s*=", html):
             rep.add("WARN", "A11Y-4", "<html> has no lang attribute")
         imgs = re.findall(r"(?is)<img\b[^>]*>", html)
-        no_alt = [i for i in imgs if not re.search(r"(?i)\balt\s*=", i)]
+        no_alt = [i for i in imgs if not re.search(r"(?i)\salt(?=\s*=|\s|/?>)", i)]
         if imgs:
             rep.add("FAIL" if no_alt else "PASS", "A11Y-1", f"Images without alt: {len(no_alt)}/{len(imgs)}",
                     "; ".join(x[:80] for x in no_alt[:3]))

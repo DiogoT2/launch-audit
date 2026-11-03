@@ -45,6 +45,7 @@ If the user is unavailable, assume EU + US, adults only, report first, and say s
 ```bash
 python3 scripts/scan.py <repo-path>              # working tree
 python3 scripts/scan.py <repo-path> --history    # also scan git history for secrets
+python3 scripts/scan.py <repo-path> --all-files  # include what .gitignore excludes (built bundles)
 python3 scripts/check_live.py https://staging.example.com   # live headers, cookies, CORS, exposed files
 ```
 
